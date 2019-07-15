@@ -160,21 +160,25 @@ module Sidekiq
 
       ack = true
       begin
+        log job_hash['jid'], "Processor.process:starting"
         dispatch(job_hash, queue) do |worker|
           Sidekiq.server_middleware.invoke(worker, job_hash, queue) do
             execute_job(worker, cloned(job_hash['args']))
           end
         end
+        log job_hash['jid'], "Processor.process:finished"
       rescue Sidekiq::Shutdown
         # Had to force kill this job because it didn't finish
         # within the timeout.  Don't acknowledge the work since
         # we didn't properly finish it.
+        log job_hash['jid'], "Processor.process:shutdown"
         ack = false
       rescue Sidekiq::JobRetry::Handled => h
         # this is the common case: job raised error and Sidekiq::JobRetry::Handled
         # signals that we created a retry successfully.  We can acknowlege the job.
         e = h.cause ? h.cause : h
         handle_exception(e, { :context => "Job raised exception", :job => job_hash, :jobstr => jobstr })
+        log job_hash['jid'], "Processor.process:retry"
         raise e
       rescue Exception => ex
         # Unexpected error!  This is very bad and indicates an exception that got past
@@ -182,14 +186,25 @@ module Sidekiq
         # so it can be rescued when using Sidekiq Pro.
         ack = false
         handle_exception(ex, { :context => "Internal exception!", :job => job_hash, :jobstr => jobstr })
+        log job_hash['jid'], "Processor.process:exception"
         raise e
       ensure
         work.acknowledge if ack
+        log job_hash['jid'], "Processor.process:acknowledge: #{ack}"
       end
     end
 
     def execute_job(worker, cloned_args)
       worker.perform(*cloned_args)
+    end
+
+    # Logging visible when using MONITOR on sidekiq's redis instance
+    def log(jid, message)
+      Sidekiq.redis do |conn|
+        conn.set('sidekiq-debug-message', "#{jid}: #{message}")
+      end
+      # Super cautious, don't change what sidekiq does if logging errored out
+    rescue Exception => ex
     end
 
     # Ruby doesn't provide atomic counters out of the box so we'll
