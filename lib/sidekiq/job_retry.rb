@@ -73,17 +73,22 @@ module Sidekiq
     def global(msg, queue)
       yield
     rescue Handled => ex
+      log(msg["jid"], "JobRetry.global handled")
       raise ex
     rescue Sidekiq::Shutdown => ey
+      log(msg["jid"], "JobRetry.global shutdown")
       # ignore, will be pushed back onto queue during hard_shutdown
       raise ey
     rescue Exception => e
+      log(msg["jid"], "JobRetry.global exception")
       # ignore, will be pushed back onto queue during hard_shutdown
       raise Sidekiq::Shutdown if exception_caused_by_shutdown?(e)
 
       if msg['retry']
+        log(msg["jid"], "JobRetry.global retry")
         attempt_retry(nil, msg, queue, e)
       else
+        log(msg["jid"], "JobRetry.global death")
         Sidekiq.death_handlers.each do |handler|
           begin
             handler.call(msg, e)
@@ -93,6 +98,7 @@ module Sidekiq
         end
       end
 
+      log(msg["jid"], "JobRetry.global raised handled")
       raise Handled
     end
 
@@ -108,11 +114,14 @@ module Sidekiq
     def local(worker, msg, queue)
       yield
     rescue Handled => ex
+      log(msg["jid"], "JobRetry.local handled")
       raise ex
     rescue Sidekiq::Shutdown => ey
+      log(msg["jid"], "JobRetry.local shutdown")
       # ignore, will be pushed back onto queue during hard_shutdown
       raise ey
     rescue Exception => e
+      log(msg["jid"], "JobRetry.local exception")
       # ignore, will be pushed back onto queue during hard_shutdown
       raise Sidekiq::Shutdown if exception_caused_by_shutdown?(e)
 
@@ -121,9 +130,11 @@ module Sidekiq
       end
 
       raise e unless msg['retry']
+      log(msg["jid"], "JobRetry.local retry")
       attempt_retry(worker, msg, queue, e)
       # We've handled this error associated with this job, don't
       # need to handle it at the global level
+      log(msg["jid"], "JobRetry.local skip")
       raise Skip
     end
 
@@ -133,6 +144,7 @@ module Sidekiq
     # instantiate the worker instance.  All access must be guarded and
     # best effort.
     def attempt_retry(worker, msg, queue, exception)
+      log(msg["jid"], "JobRetry.attempt_retry start")
       max_retry_attempts = retry_attempts_from(msg['retry'], @max_retries)
 
       msg['queue'] = if msg['retry_queue']
@@ -166,6 +178,7 @@ module Sidekiq
       end
 
       if count < max_retry_attempts
+        log(msg["jid"], "JobRetry.attempt_retry retry")
         delay = delay_for(worker, count, exception)
         # Logging here can break retries if the logging device raises ENOSPC #3979
         #logger.debug { "Failure! Retry #{count} in #{delay} seconds" }
@@ -175,12 +188,14 @@ module Sidekiq
           conn.zadd('retry', retry_at.to_s, payload)
         end
       else
+        log(msg["jid"], "JobRetry.attempt_retry exhausted")
         # Goodbye dear message, you (re)tried your best I'm sure.
         retries_exhausted(worker, msg, exception)
       end
     end
 
     def retries_exhausted(worker, msg, exception)
+      log(msg["jid"], "JobRetry.retries_exhausted start")
       begin
         block = worker && worker.sidekiq_retries_exhausted_block
         block.call(msg, exception) if block
@@ -196,10 +211,12 @@ module Sidekiq
         end
       end
 
+      log(msg["jid"], "JobRetry.retries_exhausted to morgue")
       send_to_morgue(msg) unless msg['dead'] == false
     end
 
     def send_to_morgue(msg)
+      log(msg["jid"], "JobRetry.send_to_morgue start")
       logger.info { "Adding dead #{msg['class']} job #{msg['jid']}" }
       payload = Sidekiq.dump_json(msg)
       DeadSet.new.kill(payload, notify_failure: false)
@@ -244,6 +261,14 @@ module Sidekiq
 
       e.cause.instance_of?(Sidekiq::Shutdown) ||
         exception_caused_by_shutdown?(e.cause, checked_causes)
+    end
+
+    def log(jid, message)
+      Sidekiq.redis do |conn|
+        conn.set('sidekiq-debug-message', "#{jid}: #{message}")
+      end
+      # Super cautious, don't change what sidekiq does if logging errored out
+    rescue Exception => ex
     end
 
     # Extract message from exception.
